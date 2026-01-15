@@ -1,0 +1,16 @@
+llama-index-core
+llama-index-llms-openai
+llama-index-embeddings-openai
+llama-cloud
+llama-cloud-services
+pydantic
+pandas
+python-dotenv
+nest-asyncio
+jupyter
+matplotlib
+seaborn
+
+# New dependencies for Docling + Gemini extraction
+docling
+google-genai

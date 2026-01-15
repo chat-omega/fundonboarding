@@ -1,0 +1,25 @@
+fastapi
+uvicorn
+python-multipart
+sse-starlette
+python-dotenv
+pydantic
+pandas
+aiofiles
+boto3
+
+# Existing dependencies
+llama-index-core
+llama-index-llms-openai
+llama-index-embeddings-openai
+llama-cloud
+llama-cloud-services
+nest-asyncio
+
+# LangSmith integration
+langsmith
+openai
+
+# New dependencies for Docling + Gemini extraction
+docling
+google-genai

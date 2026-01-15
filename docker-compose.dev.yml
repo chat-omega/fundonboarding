@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  # Backend Development Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: base
+    container_name: fund-onboarding-backend-dev
+    environment:
+      - PORT=8000
+      - PYTHONPATH=/app
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      # API Keys (set these in .env file)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}
+      - PROJECT_ID=${PROJECT_ID:-}
+      - ORGANIZATION_ID=${ORGANIZATION_ID:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./config.py:/app/config.py:ro
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./data/uploads:/app/data/uploads
+      - ./backend/logs:/app/logs
+      # Cache pip packages
+      - pip-cache:/root/.cache/pip
+    networks:
+      - app-network
+    command: ["sh", "-c", "pip install -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"]
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./backend
+          target: /app
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+            - .git/
+        - action: rebuild
+          path: ./backend/requirements.txt
+
+  # Frontend Development Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: deps
+    container_name: fund-onboarding-frontend-dev
+    environment:
+      - NODE_ENV=development
+      - NEXT_TELEMETRY_DISABLED=1
+      - BACKEND_URL=http://backend:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    networks:
+      - app-network
+    command: ["npm", "run", "dev"]
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./frontend
+          target: /app
+          ignore:
+            - node_modules/
+            - .next/
+            - .git/
+        - action: rebuild
+          path: ./frontend/package*.json
+
+networks:
+  app-network:
+    driver: bridge
+    name: fund-onboarding-network-dev
+
+volumes:
+  uploads:
+    driver: local
+  logs:
+    driver: local
+  pip-cache:
+    driver: local

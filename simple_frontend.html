@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Powered Fund Extraction</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            text-align: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }
+        .upload-section {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+        .file-input {
+            width: 100%;
+            padding: 15px;
+            border: 2px dashed #ddd;
+            border-radius: 5px;
+            cursor: pointer;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .file-input:hover {
+            border-color: #667eea;
+        }
+        .extract-btn {
+            width: 100%;
+            padding: 15px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .extract-btn:hover {
+            background: #5a67d8;
+        }
+        .extract-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            display: none;
+        }
+        .results {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            display: none;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: #e2e8f0;
+            border-radius: 5px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #667eea;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        .fund-card {
+            background: #f8fafc;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border-left: 4px solid #667eea;
+        }
+        .classification-info {
+            background: #e6fffa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+            border-left: 4px solid #38b2ac;
+        }
+        .log-output {
+            background: #1a202c;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-healthy { background-color: #48bb78; }
+        .status-processing { background-color: #ed8936; }
+        .status-error { background-color: #f56565; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 AI-Powered Fund Extraction</h1>
+        <p>Upload fund documents and let AI intelligently extract and classify the data</p>
+        <p><strong>New Features:</strong> Docling + Gemini 2.5 Flash • Multi-fund Support • Smart Classification</p>
+    </div>
+
+    <div class="upload-section">
+        <h2>📄 Upload Document</h2>
+        <input type="file" id="fileInput" accept=".pdf" class="file-input" />
+        <button id="extractBtn" class="extract-btn" onclick="startExtraction()">🚀 Extract Fund Data</button>
+        
+        <div style="margin-top: 20px;">
+            <h3>🔧 System Status</h3>
+            <div id="systemStatus">Checking...</div>
+        </div>
+    </div>
+
+    <div id="statusSection" class="status">
+        <h3>📊 Extraction Progress</h3>
+        <div id="currentStatus">Initializing...</div>
+        <div class="progress-bar">
+            <div id="progressFill" class="progress-fill"></div>
+        </div>
+        <div id="progressPercent">0%</div>
+        
+        <h4>📝 Live Log</h4>
+        <div id="logOutput" class="log-output"></div>
+    </div>
+
+    <div id="resultsSection" class="results">
+        <h3>✨ Extraction Results</h3>
+        <div id="resultsContent"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://35.174.147.10:8002';
+        
+        // Check system status on load
+        async function checkSystemStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                document.getElementById('systemStatus').innerHTML = 
+                    `<span class="status-indicator status-healthy"></span>Backend: ${data.message}`;
+            } catch (error) {
+                document.getElementById('systemStatus').innerHTML = 
+                    `<span class="status-indicator status-error"></span>Backend: Connection failed`;
+            }
+        }
+
+        async function startExtraction() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert('Please select a PDF file first!');
+                return;
+            }
+
+            // Show status section
+            document.getElementById('statusSection').style.display = 'block';
+            document.getElementById('resultsSection').style.display = 'none';
+            
+            // Reset UI
+            document.getElementById('extractBtn').disabled = true;
+            document.getElementById('logOutput').innerHTML = '';
+            updateProgress(0, 'Starting extraction...');
+
+            try {
+                // Upload file and start extraction
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const response = await fetch(`${API_BASE}/fund-extraction-agent`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                // Process streaming response
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\\n');
+                    buffer = lines.pop(); // Keep incomplete line
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const eventData = JSON.parse(line.slice(6));
+                                handleStreamEvent(eventData);
+                            } catch (e) {
+                                console.log('Parse error:', e, 'Line:', line);
+                            }
+                        }
+                    }
+                }
+
+            } catch (error) {
+                updateProgress(0, `Error: ${error.message}`);
+                addLog(`❌ Extraction failed: ${error.message}`);
+            } finally {
+                document.getElementById('extractBtn').disabled = false;
+            }
+        }
+
+        function handleStreamEvent(event) {
+            switch (event.type) {
+                case 'status':
+                    updateProgress(event.data.progress, event.data.message);
+                    break;
+                
+                case 'text':
+                    addLog(event.data.content);
+                    break;
+                
+                case 'results':
+                    showResults(event.data);
+                    updateProgress(100, 'Extraction completed!');
+                    break;
+                
+                case 'error':
+                    addLog(`❌ Error: ${event.data.message}`);
+                    updateProgress(0, 'Extraction failed');
+                    break;
+            }
+        }
+
+        function updateProgress(percent, message) {
+            document.getElementById('progressFill').style.width = `${percent}%`;
+            document.getElementById('progressPercent').textContent = `${percent}%`;
+            document.getElementById('currentStatus').textContent = message;
+        }
+
+        function addLog(message) {
+            const logOutput = document.getElementById('logOutput');
+            logOutput.innerHTML += message + '\\n';
+            logOutput.scrollTop = logOutput.scrollHeight;
+        }
+
+        function showResults(data) {
+            document.getElementById('resultsSection').style.display = 'block';
+            
+            let html = '';
+            
+            // Show classification info if available
+            if (data.metadata && data.metadata.classification) {
+                const classification = data.metadata.classification;
+                html += `
+                    <div class="classification-info">
+                        <h4>🧠 AI Classification</h4>
+                        <p><strong>Document Type:</strong> ${classification.document_type}</p>
+                        <p><strong>Confidence:</strong> ${(classification.confidence * 100).toFixed(1)}%</p>
+                        <p><strong>Reasoning:</strong> ${classification.reasoning}</p>
+                    </div>
+                `;
+            }
+
+            // Show summary
+            if (data.summary) {
+                html += `
+                    <div style="background: #f0fff4; padding: 15px; border-radius: 5px; margin: 15px 0;">
+                        <h4>📈 Summary</h4>
+                        <p><strong>Total Funds:</strong> ${data.summary.total_funds}</p>
+                        <p><strong>Extraction Method:</strong> ${data.summary.extraction_method}</p>
+                        <p><strong>Document Type:</strong> ${data.summary.document_type}</p>
+                        <p><strong>Confidence Score:</strong> ${(data.summary.confidence_score * 100).toFixed(1)}%</p>
+                    </div>
+                `;
+            }
+
+            // Show individual funds
+            if (data.funds && data.funds.length > 0) {
+                html += '<h4>💰 Extracted Funds</h4>';
+                data.funds.forEach((fund, index) => {
+                    html += `
+                        <div class="fund-card">
+                            <h5>${fund.fund_name || 'Unnamed Fund'}</h5>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 10px;">
+                    `;
+                    
+                    if (fund.ticker) html += `<p><strong>Ticker:</strong> ${fund.ticker}</p>`;
+                    if (fund.fund_type) html += `<p><strong>Type:</strong> ${fund.fund_type}</p>`;
+                    if (fund.nav) html += `<p><strong>NAV:</strong> $${fund.nav}</p>`;
+                    if (fund.expense_ratio) html += `<p><strong>Expense Ratio:</strong> ${fund.expense_ratio}%</p>`;
+                    if (fund.one_year_return) html += `<p><strong>1-Year Return:</strong> ${fund.one_year_return}%</p>`;
+                    if (fund.equity_pct) html += `<p><strong>Equity:</strong> ${fund.equity_pct}%</p>`;
+                    if (fund.fixed_income_pct) html += `<p><strong>Fixed Income:</strong> ${fund.fixed_income_pct}%</p>`;
+                    if (fund.target_equity_pct) html += `<p><strong>Target Equity:</strong> ${fund.target_equity_pct}%</p>`;
+                    
+                    html += `</div></div>`;
+                });
+            }
+
+            document.getElementById('resultsContent').innerHTML = html;
+        }
+
+        // Initialize on page load
+        checkSystemStatus();
+    </script>
+</body>
+</html>

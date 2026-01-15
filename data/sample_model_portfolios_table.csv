@@ -1,0 +1,4 @@
+Asset Class,Ticker,Name,Expense Ratio (%),Morningstar Category,Conservative (%),Mod. Conservative (%),Moderate (%),Growth (%),Aggressive (%)
+U.S. Equity,VTV,Vanguard Value ETF,0.04,US Fund Large Value,2,4,7,9,11
+U.S. Equity,VTI,Vanguard Total Stock Market ETF,0.03,US Fund Large Blend,3.5,7,12.25,15.75,19.25
+U.S. Equity,VUG,Vanguard Growth ETF,0.04,US Fund Large Growth,2,4,7,9,11

@@ -1,0 +1,395 @@
+"""FastAPI server for Fund Extraction with streaming support."""
+
+# Fix environment variables FIRST before any imports that might trigger Docling
+import os
+
+# Set appropriate HOME directory - use current user home if not in Docker
+if not os.path.exists('/app'):
+    # Running outside Docker, use user home
+    os.environ['HOME'] = os.path.expanduser('~')
+else:
+    # Running in Docker
+    os.environ['HOME'] = '/app'
+
+os.environ['TMPDIR'] = '/tmp'
+os.environ['XDG_CACHE_HOME'] = '/tmp/docling_cache'
+os.environ['XDG_DATA_HOME'] = '/tmp/docling_data'
+
+# Ensure temp directories exist
+os.makedirs('/tmp/docling_cache', exist_ok=True)
+os.makedirs('/tmp/docling_data', exist_ok=True)
+
+import json
+import uuid
+import asyncio
+import logging
+import sys
+from pathlib import Path
+from typing import AsyncGenerator, Optional
+from fastapi import FastAPI, HTTPException, UploadFile, File, Response, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import uvicorn
+
+# Configure logging - Only to stdout to avoid Docker permission issues
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Import our existing extraction logic
+import sys
+sys.path.append('..')
+from config import config
+from src.fund_extractor import FidelityFundExtraction, setup_extract_agent
+from src.split_detector import afind_categories_and_splits
+from llama_cloud_services import LlamaParse
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import Settings
+
+logger.info("Initializing Fund Extraction API...")
+
+app = FastAPI(title="Fund Extraction API", version="1.0.0")
+
+# Add request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all HTTP requests."""
+    start_time = asyncio.get_event_loop().time()
+    logger.info(f"🌐 {request.method} {request.url.path} - Starting request")
+    
+    # Check if this is a streaming endpoint
+    is_streaming_endpoint = (
+        request.url.path in ["/fund-extraction-agent", "/fund-extraction-agent-mock"] or
+        request.url.path.startswith("/api/onboarding/stream/")
+    )
+    
+    if is_streaming_endpoint:
+        # For streaming endpoints, don't wait for response completion
+        logger.info(f"🌐 {request.method} {request.url.path} - Streaming endpoint detected, starting stream...")
+        response = await call_next(request)
+        logger.info(f"🌐 {request.method} {request.url.path} - {response.status_code} - Stream started")
+        return response
+    else:
+        # For non-streaming endpoints, log normally
+        response = await call_next(request)
+        process_time = asyncio.get_event_loop().time() - start_time
+        logger.info(f"🌐 {request.method} {request.url.path} - {response.status_code} - {process_time:.3f}s")
+        return response
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000", 
+        "http://127.0.0.1:3000", 
+        "http://localhost:3001", 
+        "http://127.0.0.1:3001",
+        "http://ec2-35-174-147-10.compute-1.amazonaws.com:3001",
+        "http://35.174.147.10:3000",
+        "http://35.174.147.10:3001"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request/Response models
+class ExtractInput(BaseModel):
+    file_path: str
+    message: str = "Extract fund data from this PDF"
+    threadId: Optional[str] = None
+    messageId: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    file_path: str
+    filename: str
+    size: int
+
+class ExtractEvent(BaseModel):
+    type: str  # 'text', 'status', 'results', 'error'
+    data: dict
+
+# Global state
+extraction_sessions = {}
+
+def create_event(event_type: str, data: dict) -> str:
+    """Create Server-Sent Event format."""
+    event = ExtractEvent(type=event_type, data=data)
+    return f"data: {event.model_dump_json()}\n\n"
+
+# Helper functions moved to agent.py
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application."""
+    logger.info("Starting Fund Extraction API...")
+    
+    # Validate configuration
+    if not config.validate():
+        logger.error("Invalid configuration. Please check your API keys.")
+        raise Exception("Invalid configuration. Please check your API keys.")
+    
+    # Set up environment
+    config.setup_environment()
+    logger.info("✓ Configuration validated")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "message": "Fund Extraction API is running"}
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    """Handle file upload (PDF, CSV, Excel) with S3 storage."""
+    from utils.s3_storage import get_s3_storage
+    
+    print(f"📤 Upload request received: {file.filename} ({file.content_type})")
+    
+    allowed_extensions = {'.pdf', '.csv', '.xlsx', '.xls'}
+    file_suffix = Path(file.filename).suffix.lower()
+    
+    if file_suffix not in allowed_extensions:
+        print(f"❌ Rejected file type: {file.filename} (extension: {file_suffix})")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
+        )
+    
+    try:
+        # Read file content
+        content = await file.read()
+        file_size = len(content)
+        
+        # Try to upload to S3 first
+        s3_storage = get_s3_storage()
+        if s3_storage:
+            try:
+                s3_url = await s3_storage.upload_file(
+                    file_content=content,
+                    filename=file.filename,
+                    content_type=file.content_type
+                )
+                
+                print(f"✅ File uploaded to S3: {file.filename} ({file_size} bytes)")
+                
+                return UploadResponse(
+                    file_path=s3_url,  # Return S3 URL instead of local path
+                    filename=file.filename,
+                    size=file_size
+                )
+                
+            except Exception as s3_error:
+                print(f"⚠️ S3 upload failed, falling back to local storage: {str(s3_error)}")
+        
+        # Fallback to local storage if S3 is not available
+        # Use Docker path if running in container, otherwise use relative path
+        if os.path.exists('/app'):
+            upload_dir = Path("/app/data/uploads")
+        else:
+            upload_dir = Path("../data/uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate unique filename
+        file_id = str(uuid.uuid4())
+        file_path = upload_dir / f"{file_id}_{file.filename}"
+        
+        # Save file locally
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+        
+        print(f"✅ File uploaded locally: {file.filename} ({file_size} bytes)")
+        
+        return UploadResponse(
+            file_path=str(file_path),
+            filename=file.filename,
+            size=file_size
+        )
+        
+    except Exception as e:
+        print(f"❌ Upload failed for {file.filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+@app.post("/fund-extraction-agent")
+async def run_fund_extraction_agent(file: UploadFile = File(...)):
+    """Run fund extraction with streaming updates - accepts file upload directly."""
+    from agent import FundExtractionAgent
+    
+    # Read and save file first, outside the generator
+    logger.info(f"🔍 DEBUG: Processing uploaded file: {file.filename}")
+    
+    # Validate file type
+    file_extension = Path(file.filename).suffix.lower()
+    if file_extension not in ['.pdf']:
+        async def error_generator():
+            yield create_event("error", {
+                "message": f"Unsupported file type: {file_extension}. Only PDF files are supported.",
+                "type": "validation_error"
+            })
+        return StreamingResponse(
+            error_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Transfer-Encoding": "chunked"
+            }
+        )
+    
+    # Save uploaded file to temporary location
+    try:
+        content = await file.read()
+        upload_dir = Path("/tmp/uploads")
+        upload_dir.mkdir(exist_ok=True)
+        
+        # Generate unique filename
+        file_id = str(uuid.uuid4())
+        temp_file_path = upload_dir / f"{file_id}_{file.filename}"
+        
+        # Save file
+        with open(temp_file_path, "wb") as buffer:
+            buffer.write(content)
+        
+        logger.info(f"🔍 DEBUG: File saved to {temp_file_path}")
+    except Exception as e:
+        logger.error(f"🔍 DEBUG: File save failed: {e}")
+        async def error_generator():
+            yield create_event("error", {
+                "message": f"Failed to save uploaded file: {str(e)}",
+                "type": "file_save_error"
+            })
+        return StreamingResponse(
+            error_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Transfer-Encoding": "chunked"
+            }
+        )
+    
+    # Now create the event generator with the saved file
+    async def event_generator() -> AsyncGenerator[str, None]:
+        agent = FundExtractionAgent()
+        
+        try:
+            # Stream PDF extraction events
+            logger.info(f"🔍 DEBUG: Starting PDF extraction for {temp_file_path}")
+            event_count = 0
+            async for event in agent.extract_from_pdf(str(temp_file_path), "Extract fund data from this PDF"):
+                event_count += 1
+                logger.info(f"🔍 DEBUG: Yielding event {event_count}: {event.type.value}")
+                yield create_event(event.type.value, event.data)
+                
+                # Update session state
+                if event.type.value == "status":
+                    session_id = getattr(agent, 'session_id', 'unknown')
+                    extraction_sessions[session_id] = {
+                        "status": event.data.get("stage", "processing"),
+                        "progress": event.data.get("progress", 0),
+                        "message": event.data.get("message", "")
+                    }
+            logger.info(f"🔍 DEBUG: PDF extraction completed, yielded {event_count} events")
+            
+        except Exception as e:
+            logger.error(f"🔍 DEBUG: Exception in event_generator: {e}")
+            yield create_event("error", {
+                "message": str(e),
+                "type": "extraction_error"
+            })
+        finally:
+            # Clean up temporary file
+            if temp_file_path.exists():
+                temp_file_path.unlink()
+                logger.info(f"🔍 DEBUG: Cleaned up temporary file: {temp_file_path}")
+            logger.info(f"🔍 DEBUG: event_generator completed for {file.filename}")
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Transfer-Encoding": "chunked"
+        }
+    )
+
+@app.get("/extraction/{session_id}")
+async def get_extraction_status(session_id: str):
+    """Get extraction session status."""
+    if session_id not in extraction_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return extraction_sessions[session_id]
+
+@app.post("/fund-extraction-agent-mock")
+async def run_mock_extraction(request: ExtractInput):
+    """Run mock extraction with sample data for testing."""
+    from test_mock_data import create_mock_events
+    import asyncio
+    
+    async def mock_event_generator() -> AsyncGenerator[str, None]:
+        try:
+            events = create_mock_events()
+            
+            for i, event in enumerate(events):
+                # Add realistic delays
+                if i == 0:
+                    await asyncio.sleep(0.5)
+                elif event["type"] == "fund_extracted":
+                    await asyncio.sleep(0.8)  # Simulate extraction time per fund
+                elif event["type"] == "status":
+                    await asyncio.sleep(1.0)
+                else:
+                    await asyncio.sleep(0.3)
+                
+                yield create_event(event["type"], event["data"])
+            
+        except Exception as e:
+            yield create_event("error", {
+                "message": f"Mock extraction error: {str(e)}",
+                "type": "mock_error"
+            })
+    
+    return StreamingResponse(
+        mock_event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Transfer-Encoding": "chunked"
+        }
+    )
+
+# Include the new unified onboarding router
+from api.unified_router import router as onboarding_router
+app.include_router(onboarding_router)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+        log_level="info"
+    )
